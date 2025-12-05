@@ -1,1 +1,256 @@
 
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/samples/network_configurator.py b/samples/network_configurator.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2f625d6843c4d94235a6f1d1b5080a71f633398a
+--- /dev/null
++++ b/samples/network_configurator.py
+@@ -0,0 +1,245 @@
++"""Network configuration and discovery helper using BACpypes.
++
++This sample focuses on configuring BACnet/IP parameters and sending discovery
++queries to either the local UDP/IP network or a remote MS/TP segment reached
++through a BACnet/IP-to-MS/TP router. The goal is to make it easy to adjust the
++local interface settings (IP address, subnet mask, gateway) along with remote
++MS/TP parameters (network number, MAC address, and device identifier) before
++kicking off a Who-Is scan.
++
++The MS/TP path expects a router that speaks BACnet/IP on one side and MS/TP on
++the other. Discovery is performed by sending a remote broadcast Who-Is to the
++configured MS/TP network number, optionally directed at a specific MAC address
++when provided. Any I-Am responses are collected and printed in a concise table.
++"""
++
++import argparse
++import ipaddress
++import sys
++import threading
++from dataclasses import dataclass, field
++from typing import Dict, List, Optional
++
++from bacpypes.app import BIPSimpleApplication
++from bacpypes.core import enable_sleeping, run, stop
++from bacpypes.debugging import bacpypes_debugging, ModuleLogger
++from bacpypes.local.device import LocalDeviceObject
++from bacpypes.pdu import Address
++from bacpypes.apdu import IAmRequest, WhoIsRequest
++
++
++# some debugging
++_debug = 0
++_log = ModuleLogger(globals())
++
++
++@dataclass
++class IPInterfaceSettings:
++    """Local interface configuration for BACnet/IP."""
++
++    address: str
++    subnet_mask: str
++    gateway: Optional[str] = None
++    port: int = 47808
++
++    def cidr_notation(self) -> str:
++        """Render the interface address in CIDR form, including the port."""
++
++        try:
++            network = ipaddress.ip_network(f"{self.address}/{self.subnet_mask}", strict=False)
++            prefixlen = network.prefixlen
++        except ValueError:
++            # subnet mask provided as a dotted mask rather than prefix
++            network = ipaddress.ip_network(f"0.0.0.0/{self.subnet_mask}")
++            prefixlen = network.prefixlen
++
++        return f"{self.address}/{prefixlen}:{self.port}"
++
++
++@dataclass
++class MSTPSettings:
++    """Parameters used when discovering devices on an MS/TP segment."""
++
++    network_number: int
++    device_id: int
++    mac_address: Optional[int] = None
++    router: Optional[str] = None
++
++
++@dataclass
++class DiscoveryContext:
++    """State shared across discovery runs."""
++
++    device: LocalDeviceObject
++    application: BIPSimpleApplication
++    discovered: Dict[int, Dict[str, object]] = field(default_factory=dict)
++
++
++@bacpypes_debugging
++class DiscoveryApplication(BIPSimpleApplication):
++    """Collect I-Am responses while allowing Who-Is requests to be sent."""
++
++    def __init__(self, local_device: LocalDeviceObject, local_address: Address):
++        if _debug:
++            DiscoveryApplication._debug("__init__ %r %r", local_device, local_address)
++        super().__init__(local_device, local_address)
++        self.discovered: Dict[int, Dict[str, object]] = {}
++
++    def indication(self, apdu):
++        if _debug:
++            DiscoveryApplication._debug("indication %r", apdu)
++
++        if isinstance(apdu, IAmRequest):
++            device_type, device_instance = apdu.iAmDeviceIdentifier
++            # avoid duplicates by keeping the first response per device
++            if device_instance not in self.discovered:
++                self.discovered[device_instance] = {
++                    "device_type": device_type,
++                    "device_instance": device_instance,
++                    "address": apdu.pduSource,
++                    "max_apdu": apdu.maxAPDULengthAccepted,
++                    "segmentation": apdu.segmentationSupported,
++                    "vendor_id": apdu.vendorID,
++                }
++
++        super().indication(apdu)
++
++    def queue_whois(self, destination: Address, low_limit: Optional[int], high_limit: Optional[int]):
++        """Issue a Who-Is request toward the given destination."""
++
++        request = WhoIsRequest()
++        request.pduDestination = destination
++        request.deviceInstanceRangeLowLimit = low_limit
++        request.deviceInstanceRangeHighLimit = high_limit
++        self.request(request)
++
++
++def build_device(object_name: str, device_id: int) -> LocalDeviceObject:
++    """Create a minimal local device object for discovery traffic."""
++
++    return LocalDeviceObject(
++        objectName=object_name,
++        objectIdentifier=device_id,
++        maxApduLengthAccepted=1024,
++        segmentationSupported="noSegmentation",
++        vendorIdentifier=0,
++    )
++
++
++def configure_bip_app(ip_settings: IPInterfaceSettings, device: LocalDeviceObject) -> DiscoveryApplication:
++    """Initialize the BACnet/IP application using the provided settings."""
++
++    cidr_address = ip_settings.cidr_notation()
++    if _debug:
++        _log.debug("binding to %s", cidr_address)
++
++    local_address = Address(cidr_address)
++    app = DiscoveryApplication(device, local_address)
++    return app
++
++
++def update_router_reference(app: DiscoveryApplication, mstp_settings: MSTPSettings) -> None:
++    """Register a router if MS/TP discovery requires one."""
++
++    if not mstp_settings.router:
++        return
++
++    router_address = Address(mstp_settings.router)
++    app.nsap.update_router_references(None, router_address, [mstp_settings.network_number])
++
++
++def run_discovery(app: DiscoveryApplication, destination: Address, timeout: float) -> Dict[int, Dict[str, object]]:
++    """Send Who-Is and run the core loop long enough to collect replies."""
++
++    timer = threading.Timer(timeout, stop)
++    timer.daemon = True
++    timer.start()
++    try:
++        app.queue_whois(destination, None, None)
++        run()
++    finally:
++        timer.cancel()
++
++    return app.discovered
++
++
++def format_results(results: Dict[int, Dict[str, object]]) -> List[str]:
++    """Return sorted, human readable discovery rows."""
++
++    if not results:
++        return ["No devices responded to the Who-Is request."]
++
++    lines = ["device_id\taddress\tmax_apdu\tsegmentation\tvendor_id"]
++    for device_id in sorted(results):
++        entry = results[device_id]
++        lines.append(
++            f"{device_id}\t{entry['address']}\t{entry['max_apdu']}\t{entry['segmentation']}\t{entry['vendor_id']}"
++        )
++    return lines
++
++
++def parse_args(argv: List[str]) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description="Configure BACnet network settings and run discovery scans.")
++    parser.add_argument("--object-name", default="Configurator", help="Local device object name")
++    parser.add_argument("--device-id", type=int, default=999, help="Local device identifier")
++    parser.add_argument("--ip-address", required=True, help="Local IP address for BACnet/IP traffic")
++    parser.add_argument("--subnet-mask", required=True, help="Local subnet mask (dotted or prefix)")
++    parser.add_argument("--gateway", help="Gateway IP address for reference")
++    parser.add_argument("--port", type=int, default=47808, help="UDP port to bind for BACnet/IP (default 47808)")
++    parser.add_argument("--mode", choices=["udpip", "mstp"], default="udpip", help="Choose discovery medium")
++    parser.add_argument("--mstp-network", type=int, help="Remote MS/TP network number")
++    parser.add_argument("--mstp-mac", type=int, help="Target MS/TP MAC (0-254) or omit for broadcast")
++    parser.add_argument("--mstp-router", help="BACnet/IP address for the MS/TP router (e.g. 192.168.1.5:47808)")
++    parser.add_argument("--timeout", type=float, default=5.0, help="Seconds to wait for I-Am responses")
++    return parser.parse_args(argv)
++
++
++def validate_mstp_settings(args: argparse.Namespace) -> Optional[MSTPSettings]:
++    if args.mode == "mstp":
++        if args.mstp_network is None:
++            raise ValueError("--mstp-network is required when --mode mstp is selected")
++        if args.mstp_mac is not None and not 0 <= args.mstp_mac <= 254:
++            raise ValueError("--mstp-mac must be between 0 and 254")
++        return MSTPSettings(
++            network_number=args.mstp_network,
++            device_id=args.device_id,
++            mac_address=args.mstp_mac,
++            router=args.mstp_router,
++        )
++    return None
++
++
++def main(argv: Optional[List[str]] = None) -> int:
++    args = parse_args(argv or sys.argv[1:])
++    mstp_settings = validate_mstp_settings(args)
++
++    ip_settings = IPInterfaceSettings(
++        address=args.ip_address,
++        subnet_mask=args.subnet_mask,
++        gateway=args.gateway,
++        port=args.port,
++    )
++
++    device = build_device(args.object_name, args.device_id)
++    app = configure_bip_app(ip_settings, device)
++
++    if mstp_settings:
++        update_router_reference(app, mstp_settings)
++        destination = Address(
++            mstp_settings.network_number,
++            mstp_settings.mac_address if mstp_settings.mac_address is not None else "*",
++        )
++    else:
++        destination = Address("*")
++
++    enable_sleeping()
++    results = run_discovery(app, destination, args.timeout)
++
++    for line in format_results(results):
++        print(line)
++
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+ 
+EOF
+)
